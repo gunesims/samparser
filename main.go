@@ -10,6 +10,7 @@ References:
 - https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md
 - https://renenyffenegger.ch/notes/Windows/registry/tree/HKEY_LOCAL_MACHINE/SAM/SAM/Domains/Account/Users/000001F4/index
 - https://web.archive.org/web/20190717124313/http://www.beginningtoseethelight.org/ntsecurity/index.htm
+- https://github.com/vphpersson/msdsalgs/blob/ee7525e50ffcff4574371baac226e578078abc03/msdsalgs/crypto.py
 */
 
 import (
@@ -22,6 +23,10 @@ import (
     "encoding/binary"
     "strings"
     "encoding/hex"
+    "crypto/rc4"
+    "crypto/md5"
+    "reflect"
+    "errors"
 )
 
 func ParseInt32(reader io.ReaderAt, offset int64) (integer int32, err error) {
@@ -52,13 +57,46 @@ func UTF16LEBytesToUTF8(utf16Bytes []byte) string {
     return string(utf8Bytes)
 }
 
+func DeriveKeys(rid uint32) (key1 []byte, key2 []byte) {
+    key := make([]byte, 4)
+    binary.LittleEndian.PutUint32(key, rid)
+
+    key1 = []byte {key[0] , key[1] , key[2] , key[3] , key[0] , key[1] , key[2]}
+    key2 = []byte {key[3] , key[0] , key[1] , key[2] , key[3] , key[0] , key[1]}
+    
+    return TransformDesKey(key1), TransformDesKey(key2)
+}
+
+/*
+Adapted from https://github.com/vphpersson/msdsalgs/blob/ee7525e50ffcff4574371baac226e578078abc03/msdsalgs/crypto.py
+The process is described here:
+https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/ebdb15df-8d0d-4347-9d62-082e6eccac40
+*/
+func TransformDesKey(inputKey []byte) (outputKey []byte) {
+    outputKey = make([]byte, 8)
+
+    outputKey[0] = inputKey[0] >> 0x01
+    outputKey[1] = ((inputKey[0] & 0x01) << 6) | (inputKey[1] >> 2)
+    outputKey[2] = ((inputKey[1] & 0x03) << 5 | (inputKey[2]) >> 3)
+    outputKey[3] = ((inputKey[2] & 0x07) << 4) | (inputKey[3] >> 4)
+    outputKey[4] = ((inputKey[3] & 0x0F) << 3) | (inputKey[4] >> 5)
+    outputKey[5] = ((inputKey[4] & 0x1F) << 2) | (inputKey[5] >> 6)
+    outputKey[6] = ((inputKey[5] & 0x3F) << 1) | (inputKey[6] >> 7)
+    outputKey[7] = inputKey[6] & 0x7F
+
+    for i, _ := range outputKey {
+        outputKey[i] = (outputKey[i] << 1) & 0xfe
+    }
+
+    return outputKey
+}
+
 func RetrieveBootKeyPart(parser regparser.Registry, keyName string) (keyPart string, err error) {
     keyPath := fmt.Sprintf("\\ControlSet001\\Control\\Lsa\\%s", keyName)
     key := parser.OpenKey(keyPath)
 
     if key == nil {
-        fmt.Printf("[!] Error opening key '%s'\n", keyPath)
-        return "", nil
+        return "", errors.New(fmt.Sprintf("[!] Error opening key '%s'", key))
     }
 
     var hiveCellOffset int64
@@ -87,6 +125,71 @@ func RetrieveBootKeyPart(parser regparser.Registry, keyName string) (keyPart str
 
     return string(bootKeyPart), nil
 
+}
+
+func CalculateHashedBootKey(parser regparser.Registry, bootKey []byte) (hashedBootKey []byte, err error) {
+    keyPath := "\\SAM\\Domains\\Account"
+    key := parser.OpenKey(keyPath)
+    if key == nil {
+        return nil, errors.New(fmt.Sprintf("[!] Error opening key '%s'", key))
+    }
+
+    for _, value := range key.Values() {
+        if value.ValueName() != "F" {
+            continue
+        }
+
+        fValueData := value.ValueData().Data
+
+        key0 := int(fValueData[104])
+        if key0 != 1 {
+            return nil, errors.New(fmt.Sprintf("[!] SAM revision is '%d'", key0))
+        }
+        // fmt.Printf("[#] SAM Data Revision: %x\n", key0)
+
+        samData := fValueData[104:]
+        samKeySalt := samData[8:24]
+        // fmt.Printf("[#] SAM Key Salt: %x\n", samKeySalt)
+
+        tmpArray := make([]byte, 120)
+        copy(tmpArray[:16], samKeySalt)
+
+        // QWERTY bytes
+        qwertyBytes := []byte {33, 64, 35, 36, 37, 94, 38, 42, 40, 41, 113, 119, 101, 114, 116, 121, 85, 73, 79, 80, 65, 122, 120, 99, 118, 98, 110, 109, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 81, 41, 40, 42, 64, 38, 37, 0}
+        copy(tmpArray[16:63], qwertyBytes)
+        copy(tmpArray[63:79], bootKey)
+
+        // digits bytes
+        digitsBytes := []byte {48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 0}
+        copy(tmpArray[79:120], digitsBytes)
+
+        rc4Key := md5.Sum(tmpArray)
+        // fmt.Printf("[#] RC4 Key: %x\n", rc4Key)
+
+        rc4Cipher, err := rc4.NewCipher(rc4Key[:])
+        if err != nil {
+            return nil, err
+        }
+
+        var hashedBootKey = make([]byte, 32)
+        rc4Cipher.XORKeyStream(hashedBootKey, samData[24:56])
+
+        copy(tmpArray[:16], hashedBootKey[:16])
+        copy(tmpArray[16:57], digitsBytes)
+        copy(tmpArray[57:73], hashedBootKey[:16])
+        copy(tmpArray[73:120], qwertyBytes)
+
+
+        hashedBootKeyChecksum := md5.Sum(tmpArray)
+
+        if reflect.DeepEqual(hashedBootKeyChecksum[:], hashedBootKey[16:]) {
+            return hashedBootKeyChecksum[:], nil
+        } else {
+            return nil, errors.New("Calculated checksum of Hashed Boot Key is not correct")
+        }
+    }
+
+    return nil, errors.New(fmt.Sprintf("Failed to find value F in '%s'", keyPath))
 }
 
 func main() {
@@ -170,19 +273,27 @@ func main() {
     fmt.Printf("[+] Final boot key: %x\n", string(finalBootKey))
 
     /*
-    ## Retrieving user hashes
+    ## Calculate Hashed Boot Key
     */
-
     fileSam, err := os.OpenFile(*regSam, os.O_RDONLY, 0600)
     parserSam, err := regparser.NewRegistry(fileSam)
+    hashedBootKey, err := CalculateHashedBootKey(*parserSam, finalBootKey)
+    if err != nil {
+        fmt.Printf("[!] Failed to calculate hashed boot key.\n\tError: %s\n", err)
+        os.Exit(5)
+    }
+
+    fmt.Printf("[+] Hashed boot key: %x\n", hashedBootKey)
+
+    /*
+    ## Retrieving user hashes
+    */
 
     key := parserSam.OpenKey("\\SAM\\Domains\\Account\\Users")
     if key == nil {
         fmt.Printf("[!] Error opening key '%s'\n", key)
-        os.Exit(5)
+        os.Exit(6)
     }
-
-
 
     for _, subkey := range key.Subkeys() {
         if subkey.Name() == "Names" {
@@ -194,7 +305,7 @@ func main() {
         data, err := hex.DecodeString(subkey.Name())
         if err != nil {
             fmt.Printf("[!] Failed to decode hex value '%s'\n", subkey.Name())
-            os.Exit(6)
+            os.Exit(7)
         }
 
         rid := binary.BigEndian.Uint32(data)
@@ -203,7 +314,7 @@ func main() {
         key := parserSam.OpenKey(fmt.Sprintf("\\SAM\\Domains\\Account\\Users\\%s", subkey.Name()))
         if key == nil {
             fmt.Printf("[!] Error opening key '%s'\n", key)
-            os.Exit(5)
+            os.Exit(6)
         }
 
         for _, value := range key.Values() {
@@ -226,6 +337,34 @@ func main() {
 
             userName := UTF16LEBytesToUTF8(data[userOffset:userOffset + userLength])
             fmt.Printf("[+] Username: %s\n", userName)
+
+            /*
+            ### Calculate NT and LM hashes (old style for now)
+            */
+
+            userLmHashLength := binary.LittleEndian.Uint32(sectionData[140:180])
+            fmt.Printf("[+] Length of LM hash: %d\n", userLmHashLength)
+
+            userLmHashOffset := binary.LittleEndian.Uint32(sectionData[156:160])
+            fmt.Printf("[+] Offset of LM hash: 0x%02x\n", userLmHashOffset)
+
+            fmt.Printf("[+] LM hash: %02x\n", string(data[userLmHashOffset:userLmHashOffset+userLmHashLength]))
+
+            if userLmHashLength >= 20 {
+                key1, key2 := DeriveKeys(rid)
+                fmt.Printf("[+] DES keys for decryption:\n\tKey #1: %x\n\tKey #2: %x\n", key1, key2)
+
+                // md5Hash := md5.New()
+
+            }
+
+            userNtHashLength := binary.LittleEndian.Uint32(sectionData[172:176])
+            fmt.Printf("[+] Length of NT hash: %d\n", userNtHashLength)
+
+            userNtHashOffset := binary.LittleEndian.Uint32(sectionData[168:172])
+            fmt.Printf("[+] Offset of NT Hash: 0x%02x\n", userNtHashOffset)
+
+            fmt.Printf("[+] NT hash: %02x\n", data[userNtHashOffset:userNtHashOffset+userNtHashLength])
         }
     }
 }

@@ -11,6 +11,8 @@ References:
 - https://renenyffenegger.ch/notes/Windows/registry/tree/HKEY_LOCAL_MACHINE/SAM/SAM/Domains/Account/Users/000001F4/index
 - https://web.archive.org/web/20190717124313/http://www.beginningtoseethelight.org/ntsecurity/index.htm
 - https://github.com/vphpersson/msdsalgs/blob/ee7525e50ffcff4574371baac226e578078abc03/msdsalgs/crypto.py
+- https://docs.python.org/3/library/struct.html
+- https://github.com/C-Sto/gosecretsdump/blob/v0.3.1/pkg/samreader/samreader.go
 */
 
 import (
@@ -25,8 +27,10 @@ import (
     "encoding/hex"
     "crypto/rc4"
     "crypto/md5"
+    "crypto/des"
     "reflect"
     "errors"
+    "bytes"
 )
 
 func ParseInt32(reader io.ReaderAt, offset int64) (integer int32, err error) {
@@ -57,10 +61,19 @@ func UTF16LEBytesToUTF8(utf16Bytes []byte) string {
     return string(utf8Bytes)
 }
 
-func DeriveKeys(rid uint32) (key1 []byte, key2 []byte) {
-    key := make([]byte, 4)
-    binary.LittleEndian.PutUint32(key, rid)
+/*
+Function specified here:
+https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/b1b0094f-2546-431f-b06d-582158a9f2bb
 
+Let I be the little-endian, unsigned integer.
+
+Let I[X] be the Xth byte of I, where I is interpreted as a zero-base-index array of bytes.
+Note that because I is in little-endian byte order, I[0] is the least significant byte.
+
+Key1 is a concatenation of the following values: I[0], I[1], I[2], I[3], I[0], I[1], I[2].
+Key2 is a concatenation of the following values: I[3], I[0], I[1], I[2], I[3], I[0], I[1].
+*/
+func DeriveKeys(key []byte) (key1 []byte, key2 []byte) {
     key1 = []byte {key[0] , key[1] , key[2] , key[3] , key[0] , key[1] , key[2]}
     key2 = []byte {key[3] , key[0] , key[1] , key[2] , key[3] , key[0] , key[1]}
     
@@ -71,6 +84,34 @@ func DeriveKeys(rid uint32) (key1 []byte, key2 []byte) {
 Adapted from https://github.com/vphpersson/msdsalgs/blob/ee7525e50ffcff4574371baac226e578078abc03/msdsalgs/crypto.py
 The process is described here:
 https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/ebdb15df-8d0d-4347-9d62-082e6eccac40
+
+Transform the 7-byte key into an 8-byte key as follows:
+
+Let InputKey be the 7-byte key, represented as a zero-base-index array.
+Let OutputKey be an 8-byte key, represented as a zero-base-index array.
+
+Let OutputKey be assigned as follows.
+
+OutputKey[0] = InputKey[0] >> 0x01;
+OutputKey[1] = ((InputKey[0]&0x01)<<6) | (InputKey[1]>>2);
+OutputKey[2] = ((InputKey[1]&0x03)<<5) | (InputKey[2]>>3);
+OutputKey[3] = ((InputKey[2]&0x07)<<4) | (InputKey[3]>>4);
+OutputKey[4] = ((InputKey[3]&0x0F)<<3) | (InputKey[4]>>5);
+OutputKey[5] = ((InputKey[4]&0x1F)<<2) | (InputKey[5]>>6);
+OutputKey[6] = ((InputKey[5]&0x3F)<<1) | (InputKey[6]>>7);
+OutputKey[7] = InputKey[6] & 0x7F;
+
+The 7-byte InputKey is expanded to 8 bytes by inserting a 0-bit after every seventh bit.
+
+for( int i=0; i<8; i++ )
+{
+    OutputKey[i] = (OutputKey[i] << 1) & 0xfe;
+}
+
+Let the least-significant bit of each byte of OutputKey be a parity bit.
+That is, if the sum of the preceding seven bits is odd, the eighth bit is 0; otherwise, the eighth bit is 1.
+The processing starts at the leftmost bit of OutputKey.
+
 */
 func TransformDesKey(inputKey []byte) (outputKey []byte) {
     outputKey = make([]byte, 8)
@@ -87,6 +128,8 @@ func TransformDesKey(inputKey []byte) (outputKey []byte) {
     for i, _ := range outputKey {
         outputKey[i] = (outputKey[i] << 1) & 0xfe
     }
+
+    // TODO: implement parity checks
 
     return outputKey
 }
@@ -127,6 +170,10 @@ func RetrieveBootKeyPart(parser regparser.Registry, keyName string) (keyPart str
 
 }
 
+/*
+Adapted from here:
+https://github.com/fortra/impacket/blob/82267d842c405c2315bff9a9e730c81102c139d2/impacket/examples/secretsdump.py#L1290
+*/
 func CalculateHashedBootKey(parser regparser.Registry, bootKey []byte) (hashedBootKey []byte, err error) {
     keyPath := "\\SAM\\Domains\\Account"
     key := parser.OpenKey(keyPath)
@@ -183,13 +230,67 @@ func CalculateHashedBootKey(parser regparser.Registry, bootKey []byte) (hashedBo
         hashedBootKeyChecksum := md5.Sum(tmpArray)
 
         if reflect.DeepEqual(hashedBootKeyChecksum[:], hashedBootKey[16:]) {
-            return hashedBootKeyChecksum[:], nil
+            return hashedBootKey[:16], nil
         } else {
             return nil, errors.New("Calculated checksum of Hashed Boot Key is not correct")
         }
     }
 
     return nil, errors.New(fmt.Sprintf("Failed to find value F in '%s'", keyPath))
+}
+
+func DecryptHash(userRid []byte, hashedBootKey []byte, junk []byte, isNtHash bool) (decryptedHash []byte, err error) {
+    key1, key2 := DeriveKeys(userRid)
+    fmt.Printf("[#] DES keys for decryption:\n\tKey #1: %x\n\tKey #2: %x\n", key1, key2)
+
+    
+    var buf bytes.Buffer
+    buf.Write(hashedBootKey[:16])
+    buf.Write(userRid)
+
+    if isNtHash {
+        buf.Write([]byte {78, 84, 80, 65, 83, 83, 87, 79, 82, 68, 0})
+    } else {
+         buf.Write([]byte {76, 77, 80, 65, 83, 83, 87, 79, 82, 68, 0})
+    }
+
+    fmt.Printf("[#] Data passed to MD5: %x\n", buf.Bytes())
+
+    encryptionKey := md5.Sum(buf.Bytes())
+    fmt.Printf("[#] RC4 Encryption Key: %x\n", encryptionKey)
+
+    rc4Cipher, err := rc4.NewCipher(encryptionKey[:])
+    if err != nil {
+        fmt.Printf("[#] Error creating RC4 cipher\n")
+        return []byte {}, err
+    }
+
+    encryptedDesData := make([]byte, 16)
+    rc4Cipher.XORKeyStream(encryptedDesData, junk)
+
+    fmt.Printf("[#] Encrypted DES data: %x\n", encryptedDesData)
+
+    desCipher1, err := des.NewCipher(key1)
+    if err != nil {
+        fmt.Printf("[#] Error creating DES cipher\n")
+        return []byte {}, err
+    }
+    
+    desCipher2, err := des.NewCipher(key2)
+    if err != nil {
+        fmt.Printf("[#] Error creating DES cipher\n")
+        return []byte {}, err
+    }
+
+    var buffer bytes.Buffer
+    dec := make([]byte, 8)
+
+    desCipher1.Decrypt(dec, encryptedDesData[:8])
+    buffer.Write(dec)
+    desCipher2.Decrypt(dec, encryptedDesData[8:])
+    buffer.Write(dec)
+    
+    return buffer.Bytes(), nil
 }
 
 func main() {
@@ -302,13 +403,17 @@ func main() {
 
         fmt.Printf("[+] Found user: %s\n", subkey.Name())
 
-        data, err := hex.DecodeString(subkey.Name())
+        ridBigEndianBytes, err := hex.DecodeString(subkey.Name())
         if err != nil {
             fmt.Printf("[!] Failed to decode hex value '%s'\n", subkey.Name())
             os.Exit(7)
         }
 
-        rid := binary.BigEndian.Uint32(data)
+        rid := binary.BigEndian.Uint32(ridBigEndianBytes)
+        ridLittleEndianBytes := make([]byte, 4)
+        binary.LittleEndian.PutUint32(ridLittleEndianBytes, rid)
+
+        
         fmt.Printf("[+] User RID (Relative Identifier): %d\n", rid)
 
         key := parserSam.OpenKey(fmt.Sprintf("\\SAM\\Domains\\Account\\Users\\%s", subkey.Name()))
@@ -342,19 +447,41 @@ func main() {
             ### Calculate NT and LM hashes (old style for now)
             */
 
-            userLmHashLength := binary.LittleEndian.Uint32(sectionData[140:180])
+            userLmHashLength := binary.LittleEndian.Uint32(sectionData[160:164])
             fmt.Printf("[+] Length of LM hash: %d\n", userLmHashLength)
 
             userLmHashOffset := binary.LittleEndian.Uint32(sectionData[156:160])
             fmt.Printf("[+] Offset of LM hash: 0x%02x\n", userLmHashOffset)
 
-            fmt.Printf("[+] LM hash: %02x\n", string(data[userLmHashOffset:userLmHashOffset+userLmHashLength]))
+            /*
+            ### Check the revision of the LM and NT hashes: if they are not
+            equal to 1, then it means it's a recent version of Windows
+            using AES encryption
+            */
 
+            hashRevisionBytes := data[userLmHashOffset+2:userLmHashOffset+4]
+            userLmHashRevision := binary.LittleEndian.Uint16(hashRevisionBytes)
+
+            fmt.Printf("[+] Revision of the LM Hash: %d\n", userLmHashRevision)
+            if userLmHashRevision != 1 {
+                fmt.Printf("[!] Current revision of LM hash (%d) is not supported\n", userLmHashRevision)
+                os.Exit(7)
+            }
+
+            var userLmHash []byte
             if userLmHashLength >= 20 {
-                key1, key2 := DeriveKeys(rid)
-                fmt.Printf("[+] DES keys for decryption:\n\tKey #1: %x\n\tKey #2: %x\n", key1, key2)
+                // We're skipping the first 4 bytes of the hash data, because they contain
+                // PekID (still don't know what this is) and the hash revision
+                userLmHash = data[userLmHashOffset + 4:userLmHashOffset + userLmHashLength]
+                fmt.Printf("[+] Encrypted LM hash: %02x\n", userLmHash)
 
-                // md5Hash := md5.New()
+                decryptedLmHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userLmHash, false)
+                if err != nil {
+                    fmt.Printf("[!] Error decrypting hash.\n\tError: %s\n", err)
+                    os.Exit(8)
+                }
+
+                fmt.Printf("[+] Decrypted LM Hash: %x\n", decryptedLmHash)
 
             }
 
@@ -364,7 +491,19 @@ func main() {
             userNtHashOffset := binary.LittleEndian.Uint32(sectionData[168:172])
             fmt.Printf("[+] Offset of NT Hash: 0x%02x\n", userNtHashOffset)
 
-            fmt.Printf("[+] NT hash: %02x\n", data[userNtHashOffset:userNtHashOffset+userNtHashLength])
+            var userNtHash []byte
+            if userNtHashLength >= 20 {
+                userNtHash = data[userNtHashOffset + 4:userNtHashOffset + userNtHashLength]
+                fmt.Printf("[+] Encrypted NT hash: %02x\n", userNtHash)
+                
+                decryptedNtHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userNtHash, true)
+                if err != nil {
+                    fmt.Printf("[!] Error decrypting hash.\n\tError: %s\n", err)
+                    os.Exit(8)
+                }
+
+                fmt.Printf("[+] Decrypted NT Hash: %x\n", decryptedNtHash)
+            }
         }
     }
 }

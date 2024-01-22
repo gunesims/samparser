@@ -241,7 +241,7 @@ func CalculateHashedBootKey(parser regparser.Registry, bootKey []byte) (hashedBo
 
 func DecryptHash(userRid []byte, hashedBootKey []byte, junk []byte, isNtHash bool) (decryptedHash []byte, err error) {
     key1, key2 := DeriveKeys(userRid)
-    fmt.Printf("[#] DES keys for decryption:\n\tKey #1: %x\n\tKey #2: %x\n", key1, key2)
+    // fmt.Printf("[#] DES keys for decryption:\n\tKey #1: %x\n\tKey #2: %x\n", key1, key2)
 
     
     var buf bytes.Buffer
@@ -254,31 +254,31 @@ func DecryptHash(userRid []byte, hashedBootKey []byte, junk []byte, isNtHash boo
          buf.Write([]byte {76, 77, 80, 65, 83, 83, 87, 79, 82, 68, 0})
     }
 
-    fmt.Printf("[#] Data passed to MD5: %x\n", buf.Bytes())
+    // fmt.Printf("[#] Data passed to MD5: %x\n", buf.Bytes())
 
     encryptionKey := md5.Sum(buf.Bytes())
-    fmt.Printf("[#] RC4 Encryption Key: %x\n", encryptionKey)
+    // fmt.Printf("[#] RC4 Encryption Key: %x\n", encryptionKey)
 
     rc4Cipher, err := rc4.NewCipher(encryptionKey[:])
     if err != nil {
-        fmt.Printf("[#] Error creating RC4 cipher\n")
+        // fmt.Printf("[#] Error creating RC4 cipher\n")
         return []byte {}, err
     }
 
     encryptedDesData := make([]byte, 16)
     rc4Cipher.XORKeyStream(encryptedDesData, junk)
 
-    fmt.Printf("[#] Encrypted DES data: %x\n", encryptedDesData)
+    // fmt.Printf("[#] Encrypted DES data: %x\n", encryptedDesData)
 
     desCipher1, err := des.NewCipher(key1)
     if err != nil {
-        fmt.Printf("[#] Error creating DES cipher\n")
+        // fmt.Printf("[#] Error creating DES cipher\n")
         return []byte {}, err
     }
     
     desCipher2, err := des.NewCipher(key2)
     if err != nil {
-        fmt.Printf("[#] Error creating DES cipher\n")
+        // fmt.Printf("[#] Error creating DES cipher\n")
         return []byte {}, err
     }
 
@@ -344,7 +344,7 @@ func main() {
     var scrambledKey strings.Builder
 
     for _, key := range []string {"JD", "Skew1", "GBG", "Data"} {
-        fmt.Printf("[+] Retrieving part '%s' of the boot key\n", key)
+        // fmt.Printf("[+] Retrieving part '%s' of the boot key\n", key)
 
         bootKeyPart, err := RetrieveBootKeyPart(*parserSystem, key)
         if err != nil {
@@ -352,11 +352,11 @@ func main() {
             os.Exit(3)
         }
 
-        fmt.Printf("[+] Part of the boot key: '%s'\n", string(bootKeyPart))
+        // fmt.Printf("[+] Part of the boot key: '%s'\n", string(bootKeyPart))
         scrambledKey.WriteString(string(bootKeyPart))
     }
 
-    fmt.Printf("[+] Scrambled boot key: %s\n", scrambledKey.String())
+    // fmt.Printf("[+] Scrambled boot key: %s\n", scrambledKey.String())
     
     bootKeyBytes, err := hex.DecodeString(scrambledKey.String())
     if err != nil {
@@ -401,7 +401,8 @@ func main() {
             continue
         }
 
-        fmt.Printf("[+] Found user: %s\n", subkey.Name())
+        // fmt.Printf("[+] Found user: %s\n", subkey.Name())
+        fmt.Printf("[+] Found user:\n")
 
         ridBigEndianBytes, err := hex.DecodeString(subkey.Name())
         if err != nil {
@@ -414,7 +415,7 @@ func main() {
         binary.LittleEndian.PutUint32(ridLittleEndianBytes, rid)
 
         
-        fmt.Printf("[+] User RID (Relative Identifier): %d\n", rid)
+        fmt.Printf("\tRID: %d\n", rid)
 
         key := parserSam.OpenKey(fmt.Sprintf("\\SAM\\Domains\\Account\\Users\\%s", subkey.Name()))
         if key == nil {
@@ -427,7 +428,7 @@ func main() {
                 continue
             }
 
-            fmt.Printf("[+] Size of Data: 0x%x\n", value.DataSize())
+            // fmt.Printf("[+] Size of Data: 0x%x\n", value.DataSize())
             sectionData := value.ValueData().Data
 
             // offset calculated based on the size of this structure:
@@ -435,23 +436,23 @@ func main() {
             data := sectionData[204:]
 
             userOffset := binary.LittleEndian.Uint32(sectionData[12:16])
-            fmt.Printf("[+] Offset of username: 0x%02x\n", userOffset)
+            // fmt.Printf("[+] Offset of username: 0x%02x\n", userOffset)
 
             userLength := binary.LittleEndian.Uint32(sectionData[16:20])
-            fmt.Printf("[+] Length of username: 0x%02x\n", userLength)
+            // fmt.Printf("[+] Length of username: 0x%02x\n", userLength)
 
             userName := UTF16LEBytesToUTF8(data[userOffset:userOffset + userLength])
-            fmt.Printf("[+] Username: %s\n", userName)
+            fmt.Printf("\tUsername: %s\n", userName)
 
             /*
             ### Calculate NT and LM hashes (old style for now)
             */
 
             userLmHashLength := binary.LittleEndian.Uint32(sectionData[160:164])
-            fmt.Printf("[+] Length of LM hash: %d\n", userLmHashLength)
+            // fmt.Printf("[+] Length of LM hash: %d\n", userLmHashLength)
 
             userLmHashOffset := binary.LittleEndian.Uint32(sectionData[156:160])
-            fmt.Printf("[+] Offset of LM hash: 0x%02x\n", userLmHashOffset)
+            // fmt.Printf("[+] Offset of LM hash: 0x%02x\n", userLmHashOffset)
 
             /*
             ### Check the revision of the LM and NT hashes: if they are not
@@ -462,7 +463,7 @@ func main() {
             hashRevisionBytes := data[userLmHashOffset+2:userLmHashOffset+4]
             userLmHashRevision := binary.LittleEndian.Uint16(hashRevisionBytes)
 
-            fmt.Printf("[+] Revision of the LM Hash: %d\n", userLmHashRevision)
+            // fmt.Printf("[+] Revision of the LM Hash: %d\n", userLmHashRevision)
             if userLmHashRevision != 1 {
                 fmt.Printf("[!] Current revision of LM hash (%d) is not supported\n", userLmHashRevision)
                 os.Exit(7)
@@ -473,7 +474,7 @@ func main() {
                 // We're skipping the first 4 bytes of the hash data, because they contain
                 // PekID (still don't know what this is) and the hash revision
                 userLmHash = data[userLmHashOffset + 4:userLmHashOffset + userLmHashLength]
-                fmt.Printf("[+] Encrypted LM hash: %02x\n", userLmHash)
+                // fmt.Printf("[+] Encrypted LM hash: %02x\n", userLmHash)
 
                 decryptedLmHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userLmHash, false)
                 if err != nil {
@@ -481,20 +482,20 @@ func main() {
                     os.Exit(8)
                 }
 
-                fmt.Printf("[+] Decrypted LM Hash: %x\n", decryptedLmHash)
+                fmt.Printf("\tLM Hash: %x\n", decryptedLmHash)
 
             }
 
             userNtHashLength := binary.LittleEndian.Uint32(sectionData[172:176])
-            fmt.Printf("[+] Length of NT hash: %d\n", userNtHashLength)
+            // fmt.Printf("[+] Length of NT hash: %d\n", userNtHashLength)
 
             userNtHashOffset := binary.LittleEndian.Uint32(sectionData[168:172])
-            fmt.Printf("[+] Offset of NT Hash: 0x%02x\n", userNtHashOffset)
+            // fmt.Printf("[+] Offset of NT Hash: 0x%02x\n", userNtHashOffset)
 
             var userNtHash []byte
             if userNtHashLength >= 20 {
                 userNtHash = data[userNtHashOffset + 4:userNtHashOffset + userNtHashLength]
-                fmt.Printf("[+] Encrypted NT hash: %02x\n", userNtHash)
+                // fmt.Printf("[+] Encrypted NT hash: %02x\n", userNtHash)
                 
                 decryptedNtHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userNtHash, true)
                 if err != nil {
@@ -502,7 +503,7 @@ func main() {
                     os.Exit(8)
                 }
 
-                fmt.Printf("[+] Decrypted NT Hash: %x\n", decryptedNtHash)
+                fmt.Printf("\tNT Hash: %x\n", decryptedNtHash)
             }
         }
     }

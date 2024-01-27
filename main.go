@@ -33,6 +33,17 @@ import (
     "bytes"
 )
 
+const (
+	ErrorGeneric = 1
+	ErrorOpenHive = 2
+	ErrorOpenKey = 3
+	ErrorCreateParser = 4
+	ErrorBootKey = 5
+	ErrorDecoding = 6
+	ErrorHashRevision = 7
+	ErrorHashDecryption = 8
+)
+
 func ParseInt32(reader io.ReaderAt, offset int64) (integer int32, err error) {
     data := make([]byte, 4)
     _, err = reader.ReadAt(data, offset)
@@ -331,14 +342,14 @@ func main() {
 
     if err != nil {
         fmt.Printf("[!] Error opening SYSTEM hive at '%s'.\n\tError: %s\n", *regSystem, err)
-        os.Exit(1)
+        os.Exit(ErrorOpenHive)
     }
    
     parserSystem, err := regparser.NewRegistry(fileSystem)
 
     if err != nil {
         fmt.Printf("[!] Error parsing SYSTEM hive.\n\tError: %s\n", err)
-        os.Exit(2)
+        os.Exit(ErrorCreateParser)
     }
 
     var scrambledKey strings.Builder
@@ -349,7 +360,7 @@ func main() {
         bootKeyPart, err := RetrieveBootKeyPart(*parserSystem, key)
         if err != nil {
             fmt.Printf("[!] Failed to retrieve it.\n\tError:%s", err)
-            os.Exit(3)
+            os.Exit(ErrorBootKey)
         }
 
         // fmt.Printf("[+] Part of the boot key: '%s'\n", string(bootKeyPart))
@@ -361,7 +372,7 @@ func main() {
     bootKeyBytes, err := hex.DecodeString(scrambledKey.String())
     if err != nil {
         fmt.Printf("[!] Error decoding the scrambled boot key.\n\tError: %s", err)
-        os.Exit(4)
+        os.Exit(ErrorBootKey)
     }
 
     finalBootKey := make([]byte, 16)
@@ -381,7 +392,7 @@ func main() {
     hashedBootKey, err := CalculateHashedBootKey(*parserSam, finalBootKey)
     if err != nil {
         fmt.Printf("[!] Failed to calculate hashed boot key.\n\tError: %s\n", err)
-        os.Exit(5)
+        os.Exit(ErrorBootKey)
     }
 
     fmt.Printf("[+] Hashed boot key: %x\n", hashedBootKey)
@@ -393,7 +404,7 @@ func main() {
     key := parserSam.OpenKey("\\SAM\\Domains\\Account\\Users")
     if key == nil {
         fmt.Printf("[!] Error opening key '%s'\n", key)
-        os.Exit(6)
+        os.Exit(ErrorOpenKey)
     }
 
     for _, subkey := range key.Subkeys() {
@@ -407,7 +418,7 @@ func main() {
         ridBigEndianBytes, err := hex.DecodeString(subkey.Name())
         if err != nil {
             fmt.Printf("[!] Failed to decode hex value '%s'\n", subkey.Name())
-            os.Exit(7)
+            os.Exit(ErrorDecoding)
         }
 
         rid := binary.BigEndian.Uint32(ridBigEndianBytes)
@@ -420,7 +431,7 @@ func main() {
         key := parserSam.OpenKey(fmt.Sprintf("\\SAM\\Domains\\Account\\Users\\%s", subkey.Name()))
         if key == nil {
             fmt.Printf("[!] Error opening key '%s'\n", key)
-            os.Exit(6)
+            os.Exit(ErrorOpenKey)
         }
 
         for _, value := range key.Values() {
@@ -466,7 +477,7 @@ func main() {
             // fmt.Printf("[+] Revision of the LM Hash: %d\n", userLmHashRevision)
             if userLmHashRevision != 1 {
                 fmt.Printf("[!] Current revision of LM hash (%d) is not supported\n", userLmHashRevision)
-                os.Exit(7)
+                os.Exit(ErrorHashRevision)
             }
 
             var userLmHash []byte
@@ -479,7 +490,7 @@ func main() {
                 decryptedLmHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userLmHash, false)
                 if err != nil {
                     fmt.Printf("[!] Error decrypting hash.\n\tError: %s\n", err)
-                    os.Exit(8)
+                    os.Exit(ErrorHashDecryption)
                 }
 
                 fmt.Printf("\tLM Hash: %x\n", decryptedLmHash)
@@ -500,7 +511,7 @@ func main() {
                 decryptedNtHash, err := DecryptHash(ridLittleEndianBytes, hashedBootKey, userNtHash, true)
                 if err != nil {
                     fmt.Printf("[!] Error decrypting hash.\n\tError: %s\n", err)
-                    os.Exit(8)
+                    os.Exit(ErrorHashDecryption)
                 }
 
                 fmt.Printf("\tNT Hash: %x\n", decryptedNtHash)
